@@ -1,3 +1,14 @@
+"""
+SEC EDGAR 10-K Downloader
+-------------------------
+Why EDGAR directly (not Kaggle datasets)?
+- Real-world pipeline: companies expect you to pull live data from primary sources
+- Demonstrates API integration skills, not just notebook gymnastics
+- Data freshness — always the latest filings
+
+Interview angle: "How would you handle rate limiting on EDGAR?"
+Answer is in the retry logic below.
+"""
 import time
 import requests
 from pathlib import Path
@@ -7,6 +18,7 @@ from pydantic import BaseModel
 
 
 class FilingMetadata(BaseModel):
+    """Pydantic schema for filing metadata — enforces type safety throughout pipeline."""
     ticker: str
     cik: str
     accession_number: str
@@ -16,67 +28,107 @@ class FilingMetadata(BaseModel):
 
 
 class SECDownloader:
+    """
+    Downloads 10-K filings from SEC EDGAR.
+
+    Design decisions:
+    - Looks up the latest 10-K dynamically via EDGAR's submissions API,
+      instead of hardcoding accession numbers (which go stale every filing
+      cycle — see this repo's history for a real example of that bug).
+    - 10 req/sec EDGAR rate limit → we sleep between requests as a safety margin.
+    - User-Agent header is REQUIRED by SEC — missing/generic one risks an IP ban.
+    - We download the actual primary HTM document, not the filing index page.
+    """
+
+    SUBMISSIONS_BASE_URL = "https://data.sec.gov"
+    ARCHIVES_BASE_URL = "https://www.sec.gov"
     HEADERS = {
         "User-Agent": "RAG-Research-Project piyush@iitbhu.ac.in",
         "Accept-Encoding": "gzip, deflate",
     }
-    RATE_LIMIT_SLEEP = 0.2
-
-    # Hardcoded known 10-K URLs — production systems use a database of verified URLs
-    # These are the actual primary document URLs from SEC EDGAR (verified)
-    KNOWN_FILINGS = {
-        "AAPL": {
-            "cik": "320193",
-            "accession": "0000320193-25-000079",
-            "filing_date": "2025-10-31",
-            "doc_name": "aapl-20250927.htm",
-        },
-        "MSFT": {
-            "cik": "789019",
-            "accession": "0000950170-24-087843",
-            "filing_date": "2024-07-30",
-            "doc_name": "msft-20240630.htm",
-        },
-        "GOOGL": {
-            "cik": "1652044",
-            "accession": "0001652044-25-000014",
-            "filing_date": "2025-02-05",
-            "doc_name": "goog-20241231.htm",
-        },
-    }
+    RATE_LIMIT_SLEEP = 0.2  # seconds between requests
 
     def __init__(self, output_dir: str = "data/raw"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _build_url(self, ticker: str) -> Optional[str]:
-        info = self.KNOWN_FILINGS.get(ticker)
-        if not info:
-            return None
-        cik = info["cik"]
-        accession_no_dash = info["accession"].replace("-", "")
-        doc_name = info["doc_name"]
-        return (
-            f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-            f"{accession_no_dash}/{doc_name}"
-        )
-
     def get_latest_10k_url(self, cik: str, ticker: str) -> Optional[FilingMetadata]:
-        info = self.KNOWN_FILINGS.get(ticker)
-        if not info:
-            logger.error(f"No known filing for {ticker}")
+        """
+        Fetches the most recent 10-K filing metadata for a given CIK.
+        Failure mode: CIK not found or no 10-K in recent filings → returns None.
+        """
+        cik_padded = cik.zfill(10)
+        url = f"{self.SUBMISSIONS_BASE_URL}/submissions/CIK{cik_padded}.json"
+
+        try:
+            response = requests.get(url, headers=self.HEADERS, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            time.sleep(self.RATE_LIMIT_SLEEP)
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch submissions for {ticker}: {e}")
             return None
 
-        doc_url = self._build_url(ticker)
-        return FilingMetadata(
-            ticker=ticker,
-            cik=cik,
-            accession_number=info["accession"],
-            filing_date=info["filing_date"],
-            document_url=doc_url or "",
+        filings = data.get("filings", {}).get("recent", {})
+        forms = filings.get("form", [])
+
+        for i, form in enumerate(forms):
+            if form == "10-K":
+                accession_raw = filings["accessionNumber"][i]
+                accession_no_dash = accession_raw.replace("-", "")
+                filing_date = filings["filingDate"][i]
+
+                doc_url = self._get_primary_document_url(
+                    cik_padded, accession_raw, accession_no_dash, ticker
+                )
+
+                return FilingMetadata(
+                    ticker=ticker,
+                    cik=cik,
+                    accession_number=accession_raw,
+                    filing_date=filing_date,
+                    document_url=doc_url or "",
+                )
+
+        logger.warning(f"No 10-K found for {ticker}")
+        return None
+
+    def _get_primary_document_url(
+        self, cik_padded: str, accession_dashed: str, accession_no_dash: str, ticker: str
+    ) -> Optional[str]:
+        """
+        Gets the URL of the primary 10-K document.
+
+        EDGAR stores multiple documents per filing (exhibits, cover pages, XBRL).
+        We fetch the filing's index.json to find the doc explicitly typed "10-K".
+        Note: this index lives under www.sec.gov/Archives/..., NOT data.sec.gov.
+        """
+        index_url = (
+            f"{self.ARCHIVES_BASE_URL}/Archives/edgar/data/{int(cik_padded)}/"
+            f"{accession_no_dash}/{accession_dashed}-index.json"
         )
+
+        try:
+            resp = requests.get(index_url, headers=self.HEADERS, timeout=10)
+            resp.raise_for_status()
+            index_data = resp.json()
+            time.sleep(self.RATE_LIMIT_SLEEP)
+        except Exception as e:
+            logger.error(f"Index fetch failed for {ticker}: {e}")
+            return None
+
+        for doc in index_data.get("documents", []):
+            if doc.get("type") == "10-K":
+                return (
+                    f"{self.ARCHIVES_BASE_URL}/Archives/edgar/data/{int(cik_padded)}/"
+                    f"{accession_no_dash}/{doc['name']}"
+                )
+
+        logger.warning(f"No primary 10-K document found in index for {ticker}")
+        return None
 
     def download(self, metadata: FilingMetadata) -> Optional[str]:
+        """Downloads the filing and saves locally. Returns local path on success."""
         if not metadata.document_url:
             logger.error(f"No document URL for {metadata.ticker}")
             return None
@@ -89,19 +141,13 @@ class SECDownloader:
             metadata.local_path = str(local_path)
             return str(local_path)
 
-        # Delete bad cached file if too small
         if local_path.exists():
             local_path.unlink()
 
         try:
-            resp = requests.get(
-                metadata.document_url,
-                headers=self.HEADERS,
-                timeout=60
-            )
+            resp = requests.get(metadata.document_url, headers=self.HEADERS, timeout=60)
             resp.raise_for_status()
 
-            # Sanity check — real 10-K is always > 500KB
             if len(resp.content) < 500_000:
                 logger.error(
                     f"File too small ({len(resp.content)/1024:.1f} KB) — "
@@ -111,9 +157,7 @@ class SECDownloader:
                 return None
 
             local_path.write_bytes(resp.content)
-            logger.success(
-                f"Downloaded {filename} ({len(resp.content)/1024:.1f} KB)"
-            )
+            logger.success(f"Downloaded {filename} ({len(resp.content)/1024:.1f} KB)")
             metadata.local_path = str(local_path)
             time.sleep(self.RATE_LIMIT_SLEEP)
             return str(local_path)
