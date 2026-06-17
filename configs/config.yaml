@@ -1,0 +1,21 @@
+%%writefile configs/config.yaml
+
+project:
+  name: "enterprise-rag-system"
+  version: "1.0.0"
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  target_companies:
+    - ticker: "AAPL"
+      cik: "0000320193"
+    - ticker: "MSFT" 
+      cik: "0000789019"
+    - ticker: "GOOGL"
+      cik: "0001652044"
+
+parsing:
+  table_strategy: "markdown"        # preserves structure
+  min_text_length: 50               # filter boilerplate
+  extract_tables: true
